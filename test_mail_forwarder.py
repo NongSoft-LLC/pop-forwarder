@@ -669,7 +669,7 @@ class TestMailForwarder:
         new_mails = forwarder._fetch_new_mails()
         
         assert len(new_mails) == 1
-        uidl, mail_data, from_addr, subject = new_mails[0]
+        uidl, mail_data, from_addr, subject, mail_date = new_mails[0]
         assert uidl == 'uidl123'
         assert b'This is a test mail' in mail_data
         assert from_addr == 'sender@test.jp'
@@ -782,7 +782,7 @@ class TestMailForwarder:
         
         # 取得される
         assert len(new_mails) == 1
-        uidl, mail_data, from_addr, subject = new_mails[0]
+        uidl, mail_data, from_addr, subject, mail_date = new_mails[0]
         assert uidl == 'uidl_new'
         assert subject == 'New Mail'
     
@@ -977,7 +977,7 @@ class TestMailForwarder:
         new_mails = forwarder._fetch_new_mails()
         
         assert len(new_mails) == 1
-        uidl, mail_data, from_addr, subject = new_mails[0]
+        uidl, mail_data, from_addr, subject, mail_date = new_mails[0]
         assert uidl == 'uidl_jp_001'
         assert from_addr == 'sender@test.jp'
         # 件名がエンコードされた状態で取得される
@@ -1015,7 +1015,7 @@ class TestMailForwarder:
         new_mails = forwarder._fetch_new_mails()
         
         assert len(new_mails) == 1
-        uidl, mail_data, from_addr, subject = new_mails[0]
+        uidl, mail_data, from_addr, subject, mail_date = new_mails[0]
         assert uidl == 'uidl_jp_002'
         # parseaddrはメールアドレス部分のみを抽出
         assert from_addr == 'sender@test.jp'
@@ -1098,8 +1098,8 @@ class TestMailForwarder:
         
         # モックの設定
         mock_fetch.return_value = [
-            ('uidl1', b'mail1', 'sender1@test.jp', 'Subject1'),
-            ('uidl2', b'mail2', 'sender2@test.jp', 'Subject2')
+            ('uidl1', b'mail1', 'sender1@test.jp', 'Subject1', None),
+            ('uidl2', b'mail2', 'sender2@test.jp', 'Subject2', None)
         ]
         mock_forward.return_value = True
         
