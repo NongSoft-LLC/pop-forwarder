@@ -18,10 +18,82 @@ import logging
 import getpass
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
+from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+
+
+def decode_mail_header(header_value: str) -> str:
+    """
+    メールヘッダー（Subject等）をデコードして読みやすい文字列に変換
+    エンコーディング名を先頭に表示
+    
+    Args:
+        header_value: エンコードされたヘッダー値
+    
+    Returns:
+        デコードされた文字列（例: "[UTF-8] 件名"）
+    """
+    if not header_value:
+        return "(件名なし)"
+    
+    try:
+        decoded_parts = []
+        detected_encoding = None
+        
+        for part, encoding in decode_header(header_value):
+            if isinstance(part, bytes):
+                # 最初のエンコーディングを記録
+                if detected_encoding is None and encoding:
+                    detected_encoding = encoding.upper()
+                
+                # エンコーディングが指定されている場合はそれを使用
+                if encoding:
+                    try:
+                        decoded_parts.append(part.decode(encoding))
+                    except (UnicodeDecodeError, LookupError):
+                        # エンコーディング失敗時はUTF-8で試行
+                        try:
+                            decoded_parts.append(part.decode('utf-8'))
+                            if detected_encoding is None:
+                                detected_encoding = 'UTF-8'
+                        except UnicodeDecodeError:
+                            # それでも失敗したら文字を置き換えて表示
+                            decoded_parts.append(part.decode('utf-8', errors='replace'))
+                            if detected_encoding is None:
+                                detected_encoding = 'UTF-8'
+                else:
+                    # エンコーディング不明の場合、一般的なエンコーディングを試行
+                    for enc in ['utf-8', 'iso-2022-jp', 'shift_jis', 'gbk']:
+                        try:
+                            decoded_parts.append(part.decode(enc))
+                            if detected_encoding is None:
+                                detected_encoding = enc.upper()
+                            break
+                        except (UnicodeDecodeError, LookupError):
+                            continue
+                    else:
+                        # すべて失敗したら置き換え
+                        decoded_parts.append(part.decode('utf-8', errors='replace'))
+                        if detected_encoding is None:
+                            detected_encoding = 'UNKNOWN'
+            else:
+                # 文字列の場合はそのまま追加
+                decoded_parts.append(str(part))
+        
+        decoded_text = ''.join(decoded_parts)
+        
+        # エンコーディング情報を先頭に追加
+        if detected_encoding:
+            return f"[{detected_encoding}] {decoded_text}"
+        else:
+            return f"[ASCII] {decoded_text}"
+            
+    except Exception:
+        # デコード完全失敗時は元の文字列を返す
+        return f"[RAW] {header_value}"
 
 
 def input_with_default(prompt: str, default: str) -> str:
@@ -676,7 +748,8 @@ class MailForwarder:
                 # メール解析
                 msg = message_from_bytes(mail_data)
                 from_addr = parseaddr(msg.get('From', ''))[1]
-                subject = str(msg.get('Subject', '(件名なし)'))
+                subject_raw = msg.get('Subject', '(件名なし)')
+                subject = decode_mail_header(subject_raw)
                 
                 # メールの日付を取得
                 mail_date = None
@@ -773,24 +846,36 @@ class MailForwarder:
                 self._authenticate_pop_before_smtp()
             
             # SMTP接続（ポート番号により接続方法を分岐）
+            self.logger.debug(f"SMTP接続開始: {smtp_config['host']}:{smtp_config['port']}")
             if smtp_config['port'] == 465:
                 # ポート465: SMTP over SSL
                 smtp_conn = smtplib.SMTP_SSL(
                     smtp_config['host'], 
-                    smtp_config['port']
+                    smtp_config['port'],
+                    timeout=30
                 )
             else:
                 # ポート587等: STARTTLS
                 smtp_conn = smtplib.SMTP(
                     smtp_config['host'], 
-                    smtp_config['port']
+                    smtp_config['port'],
+                    timeout=30
                 )
                 
                 if smtp_config.get('use_tls', True):
+                    self.logger.debug("STARTTLS開始...")
                     smtp_conn.starttls()
+                    self.logger.debug("STARTTLS完了")
             
-            # 認証
-            smtp_conn.login(smtp_config['username'], smtp_config['password'])
+            self.logger.debug("SMTP接続成功")
+            
+            # 認証（POP before SMTPの場合はスキップ）
+            if not smtp_config.get('pop_before_smtp', False):
+                self.logger.debug("SMTP認証開始...")
+                smtp_conn.login(smtp_config['username'], smtp_config['password'])
+                self.logger.debug("SMTP認証成功")
+            else:
+                self.logger.debug("POP before SMTP使用のため、SMTP認証はスキップ")
             
             # 元のメールをそのまま転送
             smtp_conn.sendmail(
@@ -815,6 +900,117 @@ class MailForwarder:
             )
             return False
     
+    def _forward_mail_batch(self, mails: List[Tuple]) -> List[Tuple[str, bool]]:
+        """
+        複数メールを1つのSMTP接続で転送（効率化・レート制限対策）
+        
+        Args:
+            mails: [(uidl, mail_data, from_addr, subject, mail_date), ...]
+            
+        Returns:
+            [(uidl, success), ...] 転送結果のリスト
+        """
+        smtp_config = self.config['smtp']
+        forward_config = self.config['forward']
+        results = []
+        
+        if not mails:
+            return results
+        
+        try:
+            # POP before SMTPが有効な場合、先に認証
+            if smtp_config.get('pop_before_smtp', False):
+                self._authenticate_pop_before_smtp()
+                # POP認証後、少し待機（サーバー側の処理待ち）
+                time.sleep(2)
+            
+            # SMTP接続（ポート番号により接続方法を分岐）
+            self.logger.debug(f"SMTP接続開始: {smtp_config['host']}:{smtp_config['port']}")
+            if smtp_config['port'] == 465:
+                # ポート465: SMTP over SSL
+                smtp_conn = smtplib.SMTP_SSL(
+                    smtp_config['host'], 
+                    smtp_config['port'],
+                    timeout=30
+                )
+            else:
+                # ポート587等: STARTTLS
+                smtp_conn = smtplib.SMTP(
+                    smtp_config['host'], 
+                    smtp_config['port'],
+                    timeout=30
+                )
+                
+                if smtp_config.get('use_tls', True):
+                    self.logger.debug("STARTTLS開始...")
+                    smtp_conn.starttls()
+                    self.logger.debug("STARTTLS完了")
+            
+            self.logger.debug("SMTP接続成功")
+            
+            # 認証試行
+            auth_success = False
+            
+            # POP before SMTPでも認証が必要なケースに対応
+            try:
+                if smtp_config.get('username') and smtp_config.get('password'):
+                    self.logger.debug("SMTP認証開始...")
+                    smtp_conn.login(smtp_config['username'], smtp_config['password'])
+                    self.logger.debug("SMTP認証成功")
+                    auth_success = True
+                else:
+                    self.logger.debug("SMTP認証情報なし、認証スキップ")
+                    auth_success = True  # 認証不要と判断
+            except smtplib.SMTPAuthenticationError:
+                # 認証エラーの場合、POP before SMTPのみで続行を試みる
+                if smtp_config.get('pop_before_smtp', False):
+                    self.logger.debug("SMTP認証失敗、POP before SMTPのみで続行")
+                    auth_success = True
+                else:
+                    raise
+            
+            # メール送信ループ
+            for i, (uidl, mail_data, from_addr, subject, mail_date) in enumerate(mails, 1):
+                try:
+                    # メール送信
+                    smtp_conn.sendmail(
+                        smtp_config['username'],     # 転送元（プロバイダアカウント）
+                        forward_config['to_address'], # 転送先（Gmail等）
+                        mail_data
+                    )
+                    
+                    self.logger.debug(
+                        f"メール転送成功 [{i}/{len(mails)}]: From={from_addr} Subject={subject}"
+                    )
+                    results.append((uidl, True))
+                    
+                    # 送信間隔（レート制限対策）
+                    # 最後のメール以外は待機
+                    if i < len(mails):
+                        interval = smtp_config.get('send_interval', 1)
+                        if interval > 0:
+                            self.logger.debug(f"{interval}秒待機中...")
+                            time.sleep(interval)
+                    
+                except Exception as e:
+                    self.logger.error(
+                        f"メール転送失敗 [{i}/{len(mails)}]: From={from_addr} Subject={subject} "
+                        f"エラー: {e}"
+                    )
+                    results.append((uidl, False))
+            
+            smtp_conn.quit()
+            self.logger.debug("SMTP接続を正常に終了")
+            
+        except Exception as e:
+            self.logger.error(f"SMTP接続エラー: {e}")
+            # 接続エラーの場合、全メールを失敗扱い
+            for uidl, _, _, _, _ in mails:
+                if not any(r[0] == uidl for r in results):
+                    results.append((uidl, False))
+        
+        return results
+    
     def process_once(self):
         """ワンショット処理"""
         self.logger.info("=" * 60)
@@ -833,25 +1029,29 @@ class MailForwarder:
         forwarded_details = []
         failed_details = []
         
-        # メール転送
-        for uidl, mail_data, from_addr, subject, mail_date in new_mails:
-            success = self._forward_mail(mail_data, from_addr, subject)
-            self._save_retrieved_mail(uidl, from_addr, subject, success)
+        # メール転送（バッチ処理で効率化）
+        if new_mails:
+            self.logger.info(f"{len(new_mails)}件のメールを転送中...")
+            batch_results = self._forward_mail_batch(new_mails)
             
-            if success:
-                forwarded_count += 1
-                forwarded_details.append({
-                    'from': from_addr,
-                    'subject': subject,
-                    'date': mail_date
-                })
-            else:
-                failed_count += 1
-                failed_details.append({
-                    'from': from_addr,
-                    'subject': subject,
-                    'date': mail_date
-                })
+            # 結果を処理
+            for (uidl, mail_data, from_addr, subject, mail_date), (result_uidl, success) in zip(new_mails, batch_results):
+                self._save_retrieved_mail(uidl, from_addr, subject, success)
+                
+                if success:
+                    forwarded_count += 1
+                    forwarded_details.append({
+                        'from': from_addr,
+                        'subject': subject,
+                        'date': mail_date
+                    })
+                else:
+                    failed_count += 1
+                    failed_details.append({
+                        'from': from_addr,
+                        'subject': subject,
+                        'date': mail_date
+                    })
         
         # サマリー表示
         self.logger.info("")
@@ -988,6 +1188,11 @@ def main():
              '形式: YYYY-MM-DD または YYYY-MM-DD HH:MM:SS\n'
              '例: 2025-12-30 または "2025-12-30 15:30:00"'
     )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='詳細ログを出力（DEBUGレベル）'
+    )
     
     args = parser.parse_args()
     
@@ -1017,6 +1222,13 @@ def main():
     
     # フォワーダー初期化
     forwarder = MailForwarder(args.config, start_date)
+    
+    # verboseモードの場合、ログレベルをDEBUGに変更
+    if args.verbose:
+        forwarder.logger.setLevel(logging.DEBUG)
+        for handler in forwarder.logger.handlers:
+            handler.setLevel(logging.DEBUG)
+        forwarder.logger.debug("DEBUGモードが有効になりました")
     
     # モード実行
     if args.daemon:
